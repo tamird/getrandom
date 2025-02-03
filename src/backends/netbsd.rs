@@ -8,11 +8,14 @@ use core::{
     cmp,
     ffi::c_void,
     mem::{self, MaybeUninit},
-    ptr::{self, NonNull},
+    ptr,
 };
 
 pub use crate::util::{inner_u32, inner_u64};
 
+#[expect(dead_code, reason = "LazyBool is not used")]
+#[path = "../lazy.rs"]
+mod lazy;
 #[path = "../utils/sys_fill_exact.rs"]
 mod utils;
 
@@ -34,7 +37,7 @@ unsafe extern "C" fn polyfill_using_kern_arand(
     match ret {
         0 if len <= 256 => libc::ssize_t::try_from(len).expect("len is in the range of 0..=256"),
         -1 => -1,
-        // Zero return result will be converted into `Error::UNEXPECTED` by `sys_fill_exact`
+        // Zero return result will be converted into `Error::UNEXPECTED` by `sys_fill_exact`.
         _ => 0,
     }
 }
@@ -43,27 +46,22 @@ type GetRandomFn = unsafe extern "C" fn(*mut c_void, libc::size_t, libc::c_uint)
 
 #[cold]
 #[inline(never)]
-fn init() -> NonNull<c_void> {
-    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getrandom".as_ptr()) };
-    if !cfg!(getrandom_test_netbsd_fallback) {
-        if let Some(ptr) = NonNull::new(ptr) {
-            return ptr;
-        }
+fn init() -> usize {
+    let mut ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getrandom".as_ptr()) };
+    if ptr.is_null() || cfg!(getrandom_test_netbsd_fallback) {
+        // Verify `polyfill_using_kern_arand` has the right signature.
+        const POLYFILL: GetRandomFn = polyfill_using_kern_arand;
+        ptr = POLYFILL as *mut c_void;
     }
-    // Verify `polyfill_using_kern_arand` has the right signature.
-    const POLYFILL: GetRandomFn = polyfill_using_kern_arand;
-    unsafe { NonNull::new_unchecked(POLYFILL as *mut c_void) }
+    ptr as usize
 }
 
 #[inline]
 pub fn fill_inner(dest: &mut [MaybeUninit<u8>]) -> Result<(), Error> {
-    #[path = "../utils/lazy_ptr.rs"]
-    mod lazy;
-
-    static GETRANDOM_FN: lazy::LazyPtr<c_void> = lazy::LazyPtr::new();
+    static GETRANDOM_FN: lazy::LazyUsize = lazy::LazyUsize::new();
 
     let fptr = GETRANDOM_FN.unsync_init(init);
-    let fptr = unsafe { mem::transmute::<*mut c_void, GetRandomFn>(fptr.as_ptr()) };
+    let fptr = unsafe { mem::transmute::<usize, GetRandomFn>(fptr) };
     utils::sys_fill_exact(dest, |buf| unsafe {
         fptr(buf.as_mut_ptr().cast::<c_void>(), buf.len(), 0)
     })
